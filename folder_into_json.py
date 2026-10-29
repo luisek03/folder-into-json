@@ -13,6 +13,11 @@ Jede Datei wird als Eintrag gespeichert:
 - Dateimodus (Ausführbar-Bits) bleibt erhalten.
 - Exclude-Patterns im rsync-Stil (Basename/fnmatch auf jede Pfadkomponente).
 
+RAM-Verhalten:
+  Beim Packen wird der Datei-Inhalt chunkweise (1 MiB) gelesen und direkt
+  JSON-escaped in die Zieldatei geschrieben. Peak-RAM pro Datei bleibt
+  konstant, unabhängig von der Dateigröße (auch bei 200-MB-Textdateien).
+
 Aufruf:
   pack:    python folder_json.py pack ./Eco-System Eco-System.json
   unpack:  python folder_json.py unpack Eco-System.json ./restored
@@ -26,6 +31,11 @@ import json
 import os
 import sys
 from pathlib import Path
+
+
+TEXT_SAMPLE = 8192                    # Bytes für Text/Binär-Erkennung
+TEXT_CHUNK   = 1024 * 1024            # 1 MiB Zeichen pro Lesevorgang
+B64_CHUNK    = 3 * 1024 * 1024        # Vielfaches von 3 → kein Padding-Drift
 
 
 DEFAULT_EXCLUDES = [
@@ -62,19 +72,68 @@ def matches_exclude(rel_path: Path, excludes) -> bool:
     return False
 
 
+def _looks_like_text(sample: bytes) -> bool:
+    """Heuristik: Null-Bytes → binär. Sonst UTF-8-Probe. Toleriert ein
+    Sample-Ende mitten in einem Multi-Byte-Zeichen (trim 1–3 Bytes)."""
+    if not sample:
+        return True
+    if b"\x00" in sample:
+        return False
+    for trim in range(0, 4):
+        try:
+            sample[:len(sample) - trim].decode("utf-8")
+            return True
+        except UnicodeDecodeError:
+            continue
+    return False
+
+
+def _stream_text_into_json(f_out, full_path: Path):
+    """Schreibt den Dateiinhalt als JSON-String (inkl. Quotes) chunkweise.
+    - newline="" erhält \\r\\n exakt wie im Original
+    - Textmodus + utf-8 → Python puffert unvollständige UTF-8-Sequenzen,
+      daher keine Zeichen-Boundary-Probleme beim Chunking
+    - json.dumps ist kontextfrei pro Zeichen → Escaping je Chunk ergibt
+      dasselbe Resultat wie Escaping des ganzen Strings
+    """
+    f_out.write('"')
+    with open(full_path, "r", encoding="utf-8", errors="strict", newline="") as fs:
+        while True:
+            chunk = fs.read(TEXT_CHUNK)
+            if not chunk:
+                break
+            esc = json.dumps(chunk, ensure_ascii=False)
+            f_out.write(esc[1:-1])
+    f_out.write('"')
+
+
+def _stream_binary_into_json(f_out, full_path: Path):
+    """Schreibt Base64 der Datei als JSON-String (inkl. Quotes) chunkweise."""
+    f_out.write('"')
+    with open(full_path, "rb") as fs:
+        while True:
+            chunk = fs.read(B64_CHUNK)
+            if not chunk:
+                break
+            f_out.write(base64.b64encode(chunk).decode("ascii"))
+    f_out.write('"')
+
+
 def pack(src, out_json, excludes, verbose=False):
     src = Path(src).resolve()
+    out_json = Path(out_json).resolve()
     if not src.is_dir():
         sys.exit(f"Kein Ordner: {src}")
 
-    files = []
+    # -------- Phase 1: Katalog aufbauen --------
+    # Nur Pfade + Metadaten, KEIN Datei-Inhalt im RAM.
+    entries = []
     excluded = []
 
     for root, dirs, fnames in os.walk(src):
         root_p = Path(root)
         rel_root = root_p.relative_to(src)
 
-        # Verzeichnisse prunen, damit os.walk nicht hineinläuft
         keep = []
         for d in dirs:
             rel_d = rel_root / d
@@ -93,44 +152,126 @@ def pack(src, out_json, excludes, verbose=False):
                 continue
 
             if os.path.islink(full):
-                files.append({
-                    "path": rel.as_posix(),
+                entries.append({
+                    "rel": rel.as_posix(),
+                    "full": full,
                     "type": "symlink",
                     "target": os.readlink(full),
                 })
                 continue
 
             st = full.lstat()
-            data = full.read_bytes()
-            entry = {
-                "path": rel.as_posix(),
-                "mode": st.st_mode & 0o777,
-            }
             try:
-                entry["type"] = "text"
-                entry["content"] = data.decode("utf-8")
-            except UnicodeDecodeError:
-                entry["type"] = "binary"
-                entry["encoding"] = "base64"
-                entry["content"] = base64.b64encode(data).decode("ascii")
-            files.append(entry)
+                with open(full, "rb") as fs:
+                    sample = fs.read(TEXT_SAMPLE)
+                is_text = _looks_like_text(sample)
+            except OSError as e:
+                print(f"WARN: '{rel}' nicht lesbar ({e}), als binär.",
+                      file=sys.stderr)
+                is_text = False
 
-    # Deterministische Reihenfolge → reproduzierbare JSON-Datei
-    files.sort(key=lambda e: e["path"])
+            entries.append({
+                "rel": rel.as_posix(),
+                "full": full,
+                "type": "text" if is_text else "binary",
+                "mode": st.st_mode & 0o777,
+            })
 
-    doc = {
-        "format": "folder-json",
-        "version": 1,
-        "source": src.name,
-        "excludes": excludes,
-        "file_count": len(files),
-        "files": files,
-    }
-    Path(out_json).write_text(
-        json.dumps(doc, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    return files, excluded
+    # Gleiche Sortierung wie im Original: nach Pfad-String.
+    entries.sort(key=lambda e: e["rel"])
+
+    # -------- Phase 2: JSON streamen --------
+    # In eine .tmp schreiben und erst am Ende atomar umbenennen, damit
+    # ein Abbruch während des Streamings keine halbe JSON-Datei hinterlässt.
+    tmp_json = out_json.with_name(out_json.name + ".tmp")
+
+    try:
+        with open(tmp_json, "w", encoding="utf-8", newline="\n") as f:
+            # --- Kopf (identisch zu json.dumps(..., indent=2)) ---
+            f.write("{\n")
+            f.write('  "format": "folder-json",\n')
+            f.write('  "version": 1,\n')
+            f.write(f'  "source": {json.dumps(src.name, ensure_ascii=False)},\n')
+
+            f.write('  "excludes": [\n')
+            for i, pat in enumerate(excludes):
+                comma = "," if i < len(excludes) - 1 else ""
+                f.write(f'    {json.dumps(pat, ensure_ascii=False)}{comma}\n')
+            f.write('  ],\n')
+
+            f.write(f'  "file_count": {len(entries)},\n')
+            f.write('  "files": [\n')
+
+            # --- Einträge ---
+            for i, e in enumerate(entries):
+                if i > 0:
+                    f.write(",\n")
+
+                rel_json = json.dumps(e["rel"], ensure_ascii=False)
+                t = e["type"]
+
+                if t == "symlink":
+                    target_json = json.dumps(e["target"], ensure_ascii=False)
+                    f.write('    {\n')
+                    f.write(f'      "path": {rel_json},\n')
+                    f.write('      "type": "symlink",\n')
+                    f.write(f'      "target": {target_json}\n')
+                    f.write('    }')
+                    if verbose:
+                        print(f"  L {e['rel']} -> {e['target']}")
+                    continue
+
+                if t == "binary":
+                    f.write('    {\n')
+                    f.write(f'      "path": {rel_json},\n')
+                    f.write(f'      "mode": {e["mode"]},\n')
+                    f.write('      "type": "binary",\n')
+                    f.write('      "encoding": "base64",\n')
+                    f.write('      "content": ')
+                    try:
+                        _stream_binary_into_json(f, e["full"])
+                    except OSError as ex:
+                        raise RuntimeError(
+                            f"Fehler beim Lesen von '{e['rel']}': {ex}"
+                        )
+                    f.write('\n    }')
+                    if verbose:
+                        print(f"  B {e['rel']}")
+                    continue
+
+                # text
+                f.write('    {\n')
+                f.write(f'      "path": {rel_json},\n')
+                f.write(f'      "mode": {e["mode"]},\n')
+                f.write('      "type": "text",\n')
+                f.write('      "content": ')
+                try:
+                    _stream_text_into_json(f, e["full"])
+                except UnicodeDecodeError:
+                    raise RuntimeError(
+                        f"'{e['rel']}' enthält ungültiges UTF-8 außerhalb "
+                        f"der ersten {TEXT_SAMPLE} Bytes. Bitte ausschließen "
+                        f"oder als binär behandeln."
+                    )
+                except OSError as ex:
+                    raise RuntimeError(
+                        f"Fehler beim Lesen von '{e['rel']}': {ex}"
+                    )
+                f.write('\n    }')
+                if verbose:
+                    print(f"  F {e['rel']}")
+
+            # --- Fuß ---
+            f.write("\n  ]\n")
+            f.write("}\n")
+
+        os.replace(tmp_json, out_json)
+    except Exception:
+        if tmp_json.exists():
+            tmp_json.unlink()
+        raise
+
+    return entries, excluded
 
 
 def unpack(in_json, dst, verbose=False):
@@ -154,12 +295,18 @@ def unpack(in_json, dst, verbose=False):
         if t == "binary":
             data = base64.b64decode(entry["content"])
         else:
-            data = entry["content"].encode("utf-8")
+            # newline="" damit \r\n aus dem JSON 1:1 zurückgeschrieben wird
+            with open(target, "w", encoding="utf-8", newline="") as f:
+                f.write(entry["content"])
+            if "mode" in entry:
+                os.chmod(target, entry["mode"])
+            if verbose:
+                print(f"  F {entry['path']}")
+            continue
 
         target.write_bytes(data)
         if "mode" in entry:
             os.chmod(target, entry["mode"])
-
         if verbose:
             print(f"  F {entry['path']}")
 
