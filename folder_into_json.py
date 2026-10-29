@@ -29,10 +29,6 @@ from pathlib import Path
 
 
 DEFAULT_EXCLUDES = [
-    # Host-spezifisch — /etc/nixos darf diese NICHT überschreiben
-    "host-config.nix",
-    "hardware-configuration.nix",
-
     # flake.lock: /etc/nixos ist die "lebende" Instanz
     "flake.lock",
 
@@ -42,10 +38,6 @@ DEFAULT_EXCLUDES = [
     "result",
     "result-*",
     "*.drv",
-
-    # DOCS
-    "docs",
-    "README.md",
 
     # Editor-Kram
     "*.swp",
